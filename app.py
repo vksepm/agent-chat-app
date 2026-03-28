@@ -10,6 +10,7 @@ Wires together:
 """
 
 import logging
+import os
 import uuid
 from contextlib import ExitStack
 from typing import Generator
@@ -19,6 +20,7 @@ import gradio as gr
 from src.agent import build_agent
 from src.config import load_config
 from src.mcp_client import MCPToolError, build_mcp_tools
+from theme import theme
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,6 +74,12 @@ def _make_langfuse_url(session_id: str) -> str:
     return f"{base}/project/{cfg.langfuse_project_id}/traces?sessionId={session_id}"
 
 
+def _has_tool_title(msg) -> bool:
+    """Return True if *msg* is a tool-call ChatMessage (has a metadata title)."""
+    meta = getattr(msg, "metadata", None)
+    return isinstance(meta, dict) and bool(meta.get("title"))
+
+
 def chat(
     message: str,
     history: list,
@@ -82,6 +90,10 @@ def chat(
 
     Yields incremental assistant tokens and, once complete, posts session
     metadata to the active Langfuse trace.
+
+    Tool calls produced by the smolagents ToolCallingAgent are surfaced as
+    expandable gr.ChatMessage panels (metadata title) in the chatbot, so the
+    user can inspect every MCP tool invocation and its result inline.
     """
     # --- Empty-message guard (FR-001 / edge case) ---
     if not message or not message.strip():
@@ -89,7 +101,6 @@ def chat(
         return
 
     # --- Context-window truncation guard (edge case from spec) ---
-    # Each turn = 2 messages (user + assistant) in the messages format.
     truncation_notice = ""
     if len(history) >= MAX_HISTORY_TURNS * 2:
         history = history[-(MAX_HISTORY_TURNS * 2):]
@@ -117,30 +128,86 @@ def chat(
         except Exception as exc:
             logger.warning("Could not propagate session attributes: %s", exc)
 
-    # --- Agent call with error handling (T013) ---
+    # --- Agent call with tool-call tracking ---
     try:
         from smolagents import stream_to_gradio
 
-        accumulated = ""
+        # new_messages accumulates every chunk yielded for this turn:
+        #   - gr.ChatMessage with metadata.title  → tool-call panels (expandable)
+        #   - gr.ChatMessage without metadata      → streaming final-answer text
+        # Tool-call panels are updated in-place (pending → done) by matching title.
+        new_messages: list = []
+
         for chunk in stream_to_gradio(agent, task=message, reset_agent_memory=False):
-            if hasattr(chunk, "content") and chunk.content:
-                accumulated += chunk.content
-                updated_history = history + [
-                    {"role": "user", "content": message},
-                    {"role": "assistant", "content": accumulated + truncation_notice},
-                ]
-                trace_url = _make_langfuse_url(session_id)
-                yield updated_history, session_id, trace_url
-        if not accumulated:
+            if not hasattr(chunk, "content") or chunk.content is None:
+                continue
+
+            if _has_tool_title(chunk):
+                # Tool-call chunk: update the matching existing panel or append.
+                title = chunk.metadata["title"]
+                idx = next(
+                    (
+                        i for i, m in enumerate(new_messages)
+                        if _has_tool_title(m) and m.metadata["title"] == title
+                    ),
+                    None,
+                )
+                if idx is not None:
+                    new_messages[idx] = chunk
+                else:
+                    new_messages.append(chunk)
+            else:
+                # Final-answer text chunk: replace the last non-tool message
+                # (streaming update) or append a new one.
+                last_text_idx = next(
+                    (
+                        i for i in range(len(new_messages) - 1, -1, -1)
+                        if not _has_tool_title(new_messages[i])
+                    ),
+                    None,
+                )
+                if last_text_idx is not None:
+                    new_messages[last_text_idx] = chunk
+                else:
+                    new_messages.append(chunk)
+
+            yield (
+                history + [{"role": "user", "content": message}] + new_messages,
+                session_id,
+                _make_langfuse_url(session_id),
+            )
+
+        if not new_messages:
             # Non-streaming fallback
             result = agent.run(message, reset=False)
-            accumulated = str(result)
-            updated_history = history + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": accumulated + truncation_notice},
+            new_messages = [
+                gr.ChatMessage(role="assistant", content=str(result) + truncation_notice)
             ]
-            trace_url = _make_langfuse_url(session_id)
-            yield updated_history, session_id, trace_url
+            yield (
+                history + [{"role": "user", "content": message}] + new_messages,
+                session_id,
+                _make_langfuse_url(session_id),
+            )
+        elif truncation_notice:
+            # Append truncation notice to the last plain-text message.
+            last_text_idx = next(
+                (
+                    i for i in range(len(new_messages) - 1, -1, -1)
+                    if not _has_tool_title(new_messages[i])
+                ),
+                None,
+            )
+            if last_text_idx is not None:
+                last_content = getattr(new_messages[last_text_idx], "content", "") or ""
+                new_messages[last_text_idx] = gr.ChatMessage(
+                    role="assistant", content=last_content + truncation_notice
+                )
+                yield (
+                    history + [{"role": "user", "content": message}] + new_messages,
+                    session_id,
+                    _make_langfuse_url(session_id),
+                )
+
     except MCPToolError:
         # MCPToolError is already converted to a safe "[Tool unavailable: ...]"
         # string by the tool wrapper in mcp_client.py and fed into agent reasoning.
@@ -169,6 +236,14 @@ def chat(
 
 
 # ---------------------------------------------------------------------------
+# Load stylesheet
+# ---------------------------------------------------------------------------
+
+_css_path = os.path.join(os.path.dirname(__file__), "styles.css")
+_css = open(_css_path).read() if os.path.exists(_css_path) else ""
+
+
+# ---------------------------------------------------------------------------
 # Gradio layout (gr.Blocks)
 # ---------------------------------------------------------------------------
 
@@ -176,28 +251,69 @@ def _new_session_id() -> str:
     return str(uuid.uuid4())
 
 
-with gr.Blocks(title="AI Assistant") as demo:
+_HEADER_HTML = """
+<div class="app-header">
+  <div class="app-header-icon">⚡</div>
+  <div>
+    <p class="app-header-title">AI Assistant</p>
+    <p class="app-header-subtitle">smolagents &nbsp;·&nbsp; MCP tools &nbsp;·&nbsp; Langfuse observability</p>
+  </div>
+</div>
+"""
+
+with gr.Blocks(title="AI Assistant", theme=theme, css=_css) as demo:
     # Per-session state — each browser tab gets an independent session_id (T018)
     session_state = gr.State(value=_new_session_id)
 
-    gr.Markdown("# 🤖 AI Assistant\nPowered by smolagents · MCP tools · Langfuse observability")
+    gr.HTML(_HEADER_HTML)
 
     chatbot = gr.Chatbot(
         label="Conversation",
         height=520,
+        show_label=False,
+        render_markdown=True,
+        elem_classes=["chatbot"],
+        avatar_images=(
+            None,
+            "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
+        ),
     )
-    msg_input = gr.Textbox(
-        placeholder="Ask me anything…",
-        label="Your message",
-        lines=2,
-        autofocus=True,
-    )
-    submit_btn = gr.Button("Send", variant="primary")
-    clear_btn = gr.Button("Clear conversation", variant="secondary")
+
+    with gr.Row(elem_classes=["input-row"]):
+        msg_input = gr.Textbox(
+            placeholder="Ask me anything…",
+            lines=2,
+            autofocus=True,
+            show_label=False,
+            container=False,
+            scale=9,
+        )
+        submit_btn = gr.Button(
+            "Send ↵",
+            variant="primary",
+            scale=1,
+            min_width=100,
+            elem_classes=["send-btn"],
+        )
+
+    with gr.Row():
+        clear_btn = gr.Button(
+            "🗑️  Clear conversation",
+            variant="secondary",
+            size="sm",
+            elem_classes=["clear-btn"],
+        )
 
     # Collapsible metadata panel for SC-006: session ID + Langfuse trace URL
-    with gr.Accordion("Session info", open=False):
-        session_info_md = gr.Markdown("_Send a message to see session details._")
+    with gr.Accordion(
+        "📊  Session info",
+        open=False,
+        elem_classes=["session-accordion"],
+    ):
+        session_info_md = gr.Markdown(
+            "_Send a message to see session details._",
+            elem_classes=["session-info-md"],
+        )
 
     def _update_info(trace_url: str, session_id: str) -> str:
         lines = [f"**Session ID**: `{session_id}`"]

@@ -1,0 +1,258 @@
+/* ============================================================
+   Soft Professional Tech — styles.css
+   AI Assistant chat interface
+   ============================================================ */
+
+/* ----------------------------------------------------------
+   CSS custom properties (augment Gradio theme variables)
+   ---------------------------------------------------------- */
+:root {
+    --app-header-bg:      var(--secondary-500, #3a7a9f);
+    --app-header-bg-2:    var(--secondary-600, #306685);
+    --app-header-text:    #ffffff;
+    --app-header-sub:     rgba(255, 255, 255, 0.78);
+    --app-header-height:  68px;
+
+    --tool-call-bg:       var(--primary-50,  #f8fafc);
+    --tool-call-border:   var(--secondary-200, #aecde0);
+    --tool-call-title:    var(--secondary-700, #28536c);
+    --tool-call-icon-bg:  var(--secondary-100, #d5e6ee);
+
+    --input-border:       var(--secondary-300, #80b1ce);
+    --input-focus-ring:   var(--secondary-400, #5595bc);
+
+    --chat-chrome-height-wide:   310px;
+    --chat-chrome-height-narrow: 440px;
+}
+
+/* ----------------------------------------------------------
+   App header
+   ---------------------------------------------------------- */
+.app-header {
+    background: linear-gradient(135deg, var(--app-header-bg), var(--app-header-bg-2));
+    border-radius: 12px;
+    padding: 14px 20px;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    box-shadow: 0 4px 16px rgba(58, 122, 159, 0.22);
+}
+
+.app-header-icon {
+    font-size: 32px;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.app-header-title {
+    margin: 0;
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: var(--app-header-text);
+    letter-spacing: -0.01em;
+}
+
+.app-header-subtitle {
+    margin: 2px 0 0;
+    font-size: 0.8rem;
+    color: var(--app-header-sub);
+    letter-spacing: 0.02em;
+}
+
+/* ----------------------------------------------------------
+   Main chatbot area
+   ---------------------------------------------------------- */
+div.block.chatbot {
+    height: calc(100svh - var(--chat-chrome-height-wide)) !important;
+    max-height: 820px !important;
+    border-radius: 12px !important;
+    overflow: hidden;
+}
+
+/* ----------------------------------------------------------
+   Tool-call panels rendered by smolagents + Gradio
+   Gradio renders gr.ChatMessage(metadata={"title": ...})
+   as an expandable <details> element inside the chatbot.
+   ---------------------------------------------------------- */
+
+/* Target details/summary elements inside the chatbot bubble area */
+.chatbot details,
+.message details {
+    background: var(--tool-call-bg);
+    border: 1px solid var(--tool-call-border);
+    border-radius: 8px;
+    margin: 6px 0;
+    overflow: hidden;
+    transition: box-shadow 0.15s ease;
+}
+
+.chatbot details:hover,
+.message details:hover {
+    box-shadow: 0 2px 8px rgba(58, 122, 159, 0.15);
+}
+
+.chatbot details summary,
+.message details summary {
+    cursor: pointer;
+    padding: 8px 14px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--tool-call-title);
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+}
+
+.chatbot details summary::-webkit-details-marker {
+    display: none;
+}
+
+.chatbot details summary::before {
+    content: "▶";
+    font-size: 0.65rem;
+    color: var(--secondary-400, #5595bc);
+    transition: transform 0.2s ease;
+    flex-shrink: 0;
+}
+
+.chatbot details[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.chatbot details > *:not(summary),
+.message details > *:not(summary) {
+    padding: 8px 14px 12px;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    color: var(--neutral-700, #374151);
+    border-top: 1px solid var(--tool-call-border);
+}
+
+/* "pending" tool call — subtle pulse */
+.chatbot details.pending summary::after,
+.message details.pending summary::after {
+    content: "";
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--secondary-400, #5595bc);
+    margin-left: auto;
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+}
+
+/* ----------------------------------------------------------
+   Input row (textbox + send button)
+   ---------------------------------------------------------- */
+.input-row {
+    gap: 8px !important;
+    align-items: flex-end !important;
+}
+
+.input-row textarea {
+    border: 1.5px solid var(--input-border) !important;
+    border-radius: 10px !important;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    font-size: 0.92rem !important;
+    resize: none;
+}
+
+.input-row textarea:focus {
+    border-color: var(--input-focus-ring) !important;
+    box-shadow: 0 0 0 3px rgba(85, 149, 188, 0.18) !important;
+    outline: none;
+}
+
+/* ----------------------------------------------------------
+   Buttons
+   ---------------------------------------------------------- */
+.send-btn {
+    height: 52px;
+    min-width: 100px;
+    font-weight: 600 !important;
+    letter-spacing: 0.01em;
+    border-radius: 10px !important;
+}
+
+.clear-btn {
+    font-size: 0.82rem !important;
+    font-weight: 500 !important;
+    border-radius: 8px !important;
+    padding: 6px 16px !important;
+    opacity: 0.82;
+    transition: opacity 0.15s;
+}
+
+.clear-btn:hover {
+    opacity: 1;
+}
+
+/* ----------------------------------------------------------
+   Session info accordion
+   ---------------------------------------------------------- */
+.session-accordion > .label-wrap {
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    color: var(--secondary-600, #306685) !important;
+}
+
+.session-info-md p {
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--neutral-600, #4b5563);
+}
+
+.session-info-md code {
+    background: var(--primary-100, #e2e8f0);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.78rem;
+}
+
+/* ----------------------------------------------------------
+   Responsive
+   ---------------------------------------------------------- */
+@media (max-width: 1024px) {
+    div.block.chatbot {
+        height: calc(100svh - var(--chat-chrome-height-narrow)) !important;
+    }
+}
+
+@media (max-width: 768px) {
+    .app-header {
+        padding: 10px 14px;
+        gap: 10px;
+    }
+    .app-header-icon {
+        font-size: 24px;
+    }
+    .app-header-title {
+        font-size: 1.1rem;
+    }
+    .app-header-subtitle {
+        font-size: 0.72rem;
+    }
+    div.block.chatbot {
+        max-height: 480px !important;
+    }
+}
+
+@media (max-width: 480px) {
+    div.block.chatbot {
+        max-height: 360px !important;
+    }
+}
+
+@media (max-height: 900px) {
+    .chatbot {
+        max-height: 440px !important;
+    }
+}
