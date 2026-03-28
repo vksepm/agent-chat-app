@@ -24,12 +24,12 @@ class Config:
     mcp_server_url_1: str
     mcp_server_url_2: str
 
-    # Langfuse (required for P2+ telemetry)
+    # Langfuse (required for telemetry)
     langfuse_public_key: str
     langfuse_secret_key: str
 
-    # Langfuse optional
-    langfuse_host: str = "https://cloud.langfuse.com"
+    # Langfuse optional — LANGFUSE_BASE_URL is the v4 name; LANGFUSE_HOST is kept as fallback
+    langfuse_base_url: str = "https://cloud.langfuse.com"
     langfuse_project_id: str = ""
 
     # Application metadata
@@ -58,7 +58,11 @@ def load_config() -> Config:
         mcp_server_url_2=_require("MCP_SERVER_URL_2"),
         langfuse_public_key=_require("LANGFUSE_PUBLIC_KEY"),
         langfuse_secret_key=_require("LANGFUSE_SECRET_KEY"),
-        langfuse_host=_optional("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        # LANGFUSE_BASE_URL is the v4 env var; LANGFUSE_HOST is accepted as a fallback
+        langfuse_base_url=_optional(
+            "LANGFUSE_BASE_URL",
+            _optional("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        ),
         langfuse_project_id=_optional("LANGFUSE_PROJECT_ID", ""),
         app_version=_optional("APP_VERSION", "dev"),
     )

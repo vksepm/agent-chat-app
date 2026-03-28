@@ -2,8 +2,9 @@
 src/agent.py — Agent factory.
 
 Builds a smolagents ToolCallingAgent backed by a LiteLLMModel.
-The agent is configured for multi-turn conversations (reset_memory_between_tasks=False)
-so Gradio session history is preserved across turns within a single browser session.
+Multi-turn conversation memory is preserved by passing reset=False to
+agent.run() or reset_agent_memory=False to stream_to_gradio() at call time
+(both default to resetting memory, so callers must opt-in to multi-turn mode).
 """
 
 import logging

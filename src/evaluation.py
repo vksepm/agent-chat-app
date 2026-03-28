@@ -31,10 +31,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-from langfuse import Langfuse
-from smolagents import LiteLLMModel
 
-load_dotenv(override=True)
+load_dotenv()
+
+from langfuse import Langfuse  # noqa: E402 — must be importable for test patching
+from smolagents import LiteLLMModel  # noqa: E402 — must be importable for test patching
 
 logger = logging.getLogger(__name__)
 
@@ -205,11 +206,7 @@ def run_evaluation(
         Auto-generated if not provided.
     """
     run_id = run_id or str(uuid.uuid4())[:8]
-    langfuse = Langfuse(
-        public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
-        secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
-        host=os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com"),
-    )
+    langfuse = Langfuse()
 
     model_id = os.environ.get("MODEL_ID", "")
     model_api_key = os.environ.get("MODEL_API_KEY", "")

@@ -64,11 +64,11 @@ def _make_langfuse_url(session_id: str) -> str:
     """Return a direct Langfuse trace URL for the current session, or empty string."""
     if (
         langfuse is None
-        or not cfg.langfuse_host
+        or not cfg.langfuse_base_url
         or not cfg.langfuse_project_id
     ):
         return ""
-    base = cfg.langfuse_host.rstrip("/")
+    base = cfg.langfuse_base_url.rstrip("/")
     return f"{base}/project/{cfg.langfuse_project_id}/traces?sessionId={session_id}"
 
 
@@ -89,101 +89,79 @@ def chat(
         return
 
     # --- Context-window truncation guard (edge case from spec) ---
+    # Each turn = 2 messages (user + assistant) in the messages format.
     truncation_notice = ""
     if len(history) >= MAX_HISTORY_TURNS * 2:
-        history = history[-(MAX_HISTORY_TURNS * 2) :]
+        history = history[-(MAX_HISTORY_TURNS * 2):]
         truncation_notice = (
             "\n\n_(Earlier messages were summarised to fit context limits.)_"
         )
         logger.info("Session %s: history trimmed to %d turns.", session_id, MAX_HISTORY_TURNS)
 
-    # --- Langfuse v2 native trace for this turn ---
-    # Creates one trace per user message with session_id, input, and output.
-    # Flushed after the stream completes (or on error) so every turn is recorded.
-    lf_trace = None
+    # --- Langfuse v4: propagate session metadata to all child observations ---
+    # We call __enter__() manually and intentionally skip __exit__() to avoid
+    # "Failed to detach context" errors from OpenTelemetry.  These errors occur
+    # because Gradio's streaming event loop resumes the generator in a different
+    # async task context than the one where __enter__ (and the ContextVar tokens)
+    # was called, making the reset() call in __exit__ raise ValueError.
+    # It is safe to skip __exit__() here because Gradio creates a fresh context
+    # copy (copy_context()) for every request, so the session attributes stay
+    # scoped to this one request's task and are cleaned up when the task ends.
     if langfuse is not None:
         try:
-            import uuid as _uuid
-            lf_trace = langfuse.trace(
-                id=str(_uuid.uuid4()),
-                name="chat",
+            from langfuse import propagate_attributes
+            propagate_attributes(
                 session_id=session_id,
-                input=message,
                 metadata={"app_version": cfg.app_version},
-            )
+            ).__enter__()
         except Exception as exc:
-            logger.warning("Could not create Langfuse trace: %s", exc)
+            logger.warning("Could not propagate session attributes: %s", exc)
 
     # --- Agent call with error handling (T013) ---
     try:
         from smolagents import stream_to_gradio
 
-        # Seed history with the user's message once
-        user_msg = gr.ChatMessage(role="user", content=message)
-        current_history = history + [user_msg]
-        yielded = False
-        final_output = ""
-
+        accumulated = ""
         for chunk in stream_to_gradio(agent, task=message, reset_agent_memory=False):
-            if isinstance(chunk, str):
-                # Streaming text delta — update or append the last assistant message
-                if current_history and current_history[-1].role == "assistant":
-                    current_history[-1] = gr.ChatMessage(role="assistant", content=chunk)
-                else:
-                    current_history = current_history + [gr.ChatMessage(role="assistant", content=chunk)]
-                final_output = chunk
-            elif hasattr(chunk, "role") and hasattr(chunk, "content"):
-                # Completed step message (tool call, plan, final answer, etc.)
-                current_history = current_history + [chunk]
-                if getattr(chunk, "role", "") == "assistant":
-                    final_output = str(getattr(chunk, "content", "")) or final_output
-            trace_url = _make_langfuse_url(session_id)
-            yield current_history, session_id, trace_url
-            yielded = True
-
-        if not yielded:
+            if hasattr(chunk, "content") and chunk.content:
+                accumulated += chunk.content
+                updated_history = history + [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": accumulated + truncation_notice},
+                ]
+                trace_url = _make_langfuse_url(session_id)
+                yield updated_history, session_id, trace_url
+        if not accumulated:
             # Non-streaming fallback
-            result = agent.run(message)
-            final_output = str(result) + truncation_notice
-            current_history = current_history + [gr.ChatMessage(role="assistant", content=final_output)]
+            result = agent.run(message, reset=False)
+            accumulated = str(result)
+            updated_history = history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": accumulated + truncation_notice},
+            ]
             trace_url = _make_langfuse_url(session_id)
-            yield current_history, session_id, trace_url
-
-        # Flush trace with final output to Langfuse
-        if lf_trace is not None:
-            try:
-                lf_trace.update(output=final_output)
-                langfuse.flush()
-            except Exception as exc:
-                logger.warning("Could not flush Langfuse trace: %s", exc)
+            yield updated_history, session_id, trace_url
     except MCPToolError:
+        # MCPToolError is already converted to a safe "[Tool unavailable: ...]"
+        # string by the tool wrapper in mcp_client.py and fed into agent reasoning.
+        # If it somehow escapes, surface a generic message and re-raise to the log.
         logger.exception("MCPToolError escaped agent reasoning context.")
-        if lf_trace is not None:
-            try:
-                lf_trace.update(output="[Tool error]", metadata={"error": "MCPToolError", "app_version": cfg.app_version})
-                langfuse.flush()
-            except Exception:
-                pass
         yield (
             history + [
-                gr.ChatMessage(role="user", content=message),
-                gr.ChatMessage(role="assistant", content="A tool call failed. The assistant will try to answer without it."),
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "A tool call failed. The assistant will try to answer without it."},
             ],
             session_id,
             "",
         )
     except Exception:
+        # Top-level catch-all for non-MCP exceptions (model API errors, etc.) — T013.
+        # Full traceback is logged; user receives a safe message.
         logger.exception("Unhandled error during agent.run() for session %s", session_id)
-        if lf_trace is not None:
-            try:
-                lf_trace.update(output="[Agent error]", metadata={"error": "UnhandledException", "app_version": cfg.app_version})
-                langfuse.flush()
-            except Exception:
-                pass
         yield (
             history + [
-                gr.ChatMessage(role="user", content=message),
-                gr.ChatMessage(role="assistant", content="Something went wrong. Please try again."),
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "Something went wrong. Please try again."},
             ],
             session_id,
             "",

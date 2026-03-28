@@ -1,11 +1,11 @@
 """
-check_langfuse.py — Langfuse v2 connectivity diagnostic script.
+check_langfuse.py — Langfuse v4 connectivity diagnostic script.
 
 Loads credentials from .env (same as app.py) and runs a series of checks:
   1. Env vars present
   2. Host reachable (HTTP)
-  3. Auth valid (auth_check — returns bool in v2)
-  4. Write trace (lf.trace + flush)
+  3. Auth valid (auth_check)
+  4. Write a test observation via Langfuse v4 OTEL SDK + flush
   5. Read trace back via fetch_trace
 
 Usage:
@@ -39,7 +39,11 @@ print("\n[1/5] Checking environment variables…")
 
 public_key  = os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip()
 secret_key  = os.environ.get("LANGFUSE_SECRET_KEY", "").strip()
-host        = os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com").strip()
+# LANGFUSE_BASE_URL is the v4 env var; LANGFUSE_HOST is accepted as a fallback
+host        = (
+    os.environ.get("LANGFUSE_BASE_URL", "")
+    or os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
+).strip()
 project_id  = os.environ.get("LANGFUSE_PROJECT_ID", "").strip()
 
 missing = []
@@ -81,17 +85,16 @@ print("\n[3/5] Verifying credentials (auth_check)…")
 
 os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
 os.environ["LANGFUSE_SECRET_KEY"] = secret_key
-os.environ["LANGFUSE_HOST"]       = host
+os.environ["LANGFUSE_BASE_URL"]   = host
 
 from langfuse import Langfuse
 
 lf = Langfuse(
     public_key=public_key,
     secret_key=secret_key,
-    host=host,
+    base_url=host,
 )
 
-# In Langfuse v2, auth_check() returns a boolean directly (no Pydantic parsing).
 auth_ok = False
 try:
     if lf.auth_check():
@@ -118,24 +121,30 @@ if not auth_ok:
     sys.exit(1)
 
 # ── Step 4: write a test trace ────────────────────────────────────────────────
-print("\n[4/5] Writing a test trace…")
+print("\n[4/5] Writing a test observation via Langfuse v4 OTEL SDK…")
 
-# In Langfuse v2, lf.trace() creates (or upserts) a trace and returns a
-# StatefulTraceClient. Calling .update() or .generation() on it adds children.
-trace_id = str(uuid.uuid4())
+# Langfuse v4 uses OTEL spans for trace creation. start_as_current_observation()
+# creates a span and returns a context manager; flush() sends buffered spans.
+trace_id = None
 try:
-    trace = lf.trace(
-        id=trace_id,
+    with lf.start_as_current_observation(
         name="check_langfuse_connectivity",
-        input={"test": True},
-        output={"result": "connectivity check"},
-        metadata={"source": "check_langfuse.py"},
-        tags=["connectivity-check"],
-    )
+        as_type="span",
+    ) as obs:
+        obs.update(
+            input={"test": True},
+            output={"result": "connectivity check"},
+            metadata={"source": "check_langfuse.py"},
+        )
+        # Capture the OTEL trace ID for the read-back step
+        try:
+            trace_id = obs.trace_id
+        except Exception:
+            pass
     lf.flush()
-    _ok("Trace created + flushed", f"trace_id={trace_id}")
+    _ok("Observation created + flushed", f"trace_id={trace_id or '(unavailable)'}")
 except Exception as exc:
-    _fail("Failed to create trace", str(exc))
+    _fail("Failed to create observation", str(exc))
     sys.exit(1)
 
 # ── Step 5: read trace back ───────────────────────────────────────────────────
@@ -144,13 +153,16 @@ print("\n[5/5] Reading trace back via SDK…")
 # Langfuse ingestion is async; give it a moment
 time.sleep(2)
 
-try:
-    fetched = lf.fetch_trace(trace_id)
-    trace_data = getattr(fetched, "data", fetched)
-    _ok("Trace read back", f"name={getattr(trace_data, 'name', '?')!r}  id={getattr(trace_data, 'id', trace_id)}")
-except Exception as exc:
-    _warn("Could not read trace back", str(exc))
-    print("       (Write succeeded — read-back failure may be a timing issue)")
+if trace_id is None:
+    _warn("Skipping read-back", "trace_id was not available after write")
+else:
+    try:
+        fetched = lf.fetch_trace(trace_id)
+        trace_data = getattr(fetched, "data", fetched)
+        _ok("Trace read back", f"name={getattr(trace_data, 'name', '?')!r}  id={getattr(trace_data, 'id', trace_id)}")
+    except Exception as exc:
+        _warn("Could not read trace back", str(exc))
+        print("       (Write succeeded — read-back failure may be a timing issue)")
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print("\n─────────────────────────────────────────")

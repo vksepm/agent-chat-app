@@ -1,6 +1,6 @@
-smolagents[gradio,telemetry,litellm,mcp]==1.24.0
+smolagents[gradio,telemetry]
 mcp
-langfuse>=2.0,<3.0
+langfuse>=4.0
 openinference-instrumentation-smolagents
 opentelemetry-sdk
 opentelemetry-exporter-otlp
