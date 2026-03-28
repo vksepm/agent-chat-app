@@ -43,8 +43,7 @@ def test_agent_responds_to_tool_requiring_query():
     with stack:
         agent = build_agent(
             tools=tools,
-            model_id=cfg.model_id,
-            model_api_key=cfg.model_api_key,
+            config=cfg,
         )
         response = agent.run("What tools do you have available? List them briefly.")
 
@@ -69,8 +68,7 @@ def test_agent_multi_turn_context():
     with stack:
         agent = build_agent(
             tools=tools,
-            model_id=cfg.model_id,
-            model_api_key=cfg.model_api_key,
+            config=cfg,
         )
         agent.run("My name is SpecKit.")
         follow_up = agent.run("What is my name?")
@@ -99,8 +97,7 @@ def test_agent_mcp_failure_does_not_crash():
     with stack:
         agent = build_agent(
             tools=tools,
-            model_id=cfg.model_id,
-            model_api_key=cfg.model_api_key,
+            config=cfg,
         )
         response = agent.run("Hello, are you there?")
 

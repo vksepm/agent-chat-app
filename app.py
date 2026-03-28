@@ -41,8 +41,7 @@ mcp_tools, _mcp_stack = build_mcp_tools(
 
 agent = build_agent(
     tools=mcp_tools,
-    model_id=cfg.model_id,
-    model_api_key=cfg.model_api_key,
+    config=cfg,
 )
 
 # Telemetry — import deferred so startup works even if telemetry packages are
@@ -492,7 +491,7 @@ _HEADER_HTML = """
 
 with gr.Blocks(title="AI Assistant", theme=theme, css=_css) as demo:
     # Per-session state — each browser tab gets an independent session_id (T018)
-    session_state = gr.State(value=_new_session_id)
+    session_state = gr.State(value=_new_session_id())
 
     gr.HTML(_HEADER_HTML)
 
