@@ -19,6 +19,7 @@ import gradio as gr
 
 from src.agent import build_agent
 from src.config import load_config
+from src.data_logger import init_logger, log_interaction
 from src.mcp_client import MCPToolError, build_mcp_tools
 from theme import theme
 
@@ -54,6 +55,17 @@ except ImportError:
     langfuse = None
     logger.warning("Telemetry module not available — continuing without tracing.")
 
+# ---------------------------------------------------------------------------
+# Data logger — initialise background JSONL logger + HF Hub sync
+# ---------------------------------------------------------------------------
+
+init_logger(
+    log_dir=cfg.data_log_dir,
+    repo_id=cfg.hf_dataset_repo_id,
+    hf_token=cfg.hf_token,
+    sync_interval=cfg.hf_sync_interval,
+)
+
 
 # ---------------------------------------------------------------------------
 # Gradio chat handler
@@ -78,6 +90,190 @@ def _has_tool_title(msg) -> bool:
     """Return True if *msg* is a tool-call ChatMessage (has a metadata title)."""
     meta = getattr(msg, "metadata", None)
     return isinstance(meta, dict) and bool(meta.get("title"))
+
+
+def _extract_assistant_response(messages: list) -> str:
+    """Return the final plain-text assistant response from new_messages."""
+    for msg in reversed(messages):
+        if not _has_tool_title(msg):
+            content = getattr(msg, "content", "") or ""
+            if isinstance(content, str):
+                return content
+    return ""
+
+
+def _parse_memory_steps(steps_slice: list, tool_responses: dict[str, str] | None = None) -> list[dict]:
+    """
+    Convert a slice of ``agent.memory.steps`` into a list of dicts
+    matching the ``ActionStepLog`` schema.
+
+    Only ``ActionStep`` objects are converted — ``TaskStep``,
+    ``FinalAnswerStep``, and ``PlanningStep`` are skipped.
+    The ``final_answer`` pseudo-tool is excluded from ``tool_invocations``
+    (it is captured separately as ``final_answer`` on ``ConversationTurnLog``).
+
+    Parameters
+    ----------
+    steps_slice:
+        A list of memory step objects from ``agent.memory.steps``.
+    tool_responses:
+        Optional dict ``{tool_call_id: observation_str}`` captured during
+        streaming from ``ToolOutput`` events.  When provided, each
+        ``ToolInvocation.response`` is populated with the individual tool's
+        output rather than leaving it empty.
+    """
+    responses = tool_responses or {}
+    result = []
+    for step in steps_slice:
+        # Only process ActionStep objects
+        if not hasattr(step, "tool_calls") or not hasattr(step, "step_number"):
+            continue
+
+        # Build structured tool invocations (ALL tool calls, not just [0])
+        tool_invocations = []
+        for tc in getattr(step, "tool_calls", None) or []:
+            name = getattr(tc, "name", "unknown") or "unknown"
+            if name == "final_answer":
+                # Skip the pseudo-tool; its output is stored in final_answer
+                continue
+            args = getattr(tc, "arguments", {})
+            tc_id = getattr(tc, "id", "") or ""
+            tool_invocations.append(
+                {
+                    "id": tc_id,
+                    "tool_name": name,
+                    "arguments": args if isinstance(args, dict) else str(args),
+                    "response": responses.get(tc_id, ""),
+                }
+            )
+
+        timing = getattr(step, "timing", None)
+        if timing is not None:
+            start_time = getattr(timing, "start_time", None)
+            end_time = getattr(timing, "end_time", None)
+            duration = (end_time - start_time) if (start_time is not None and end_time is not None) else None
+        else:
+            duration = None
+
+        token_usage = getattr(step, "token_usage", None)
+        input_tokens = getattr(token_usage, "input_tokens", None) if token_usage else None
+        output_tokens = getattr(token_usage, "output_tokens", None) if token_usage else None
+        total_tokens = getattr(token_usage, "total_tokens", None) if token_usage else None
+
+        error = getattr(step, "error", None)
+
+        result.append(
+            {
+                "step_number": int(getattr(step, "step_number", len(result) + 1)),
+                "model_output": str(getattr(step, "model_output", "") or ""),
+                "tool_invocations": tool_invocations,
+                "observations": str(getattr(step, "observations", "") or ""),
+                "duration_seconds": float(duration) if duration is not None else None,
+                "input_tokens": int(input_tokens) if input_tokens is not None else None,
+                "output_tokens": int(output_tokens) if output_tokens is not None else None,
+                "total_tokens": int(total_tokens) if total_tokens is not None else None,
+                "error": str(error) if error is not None else None,
+            }
+        )
+    return result
+
+
+def _supplement_tool_panels(new_messages: list, steps_slice: list) -> list:
+    """
+    Inject missing tool-call panels into *new_messages* for any tool call
+    in *steps_slice* whose name is not already represented.
+
+    smolagents' ``_process_action_step`` only creates a panel for
+    ``tool_calls[0]``; this function adds panels for ``tool_calls[1:]``
+    so every parallel tool call is visible in the Gradio chatbot.
+
+    Parameters
+    ----------
+    new_messages:
+        The accumulated list of ``gr.ChatMessage`` objects from streaming.
+    steps_slice:
+        A list of memory step objects from ``agent.memory.steps``.
+    """
+    # Collect tool names already present in new_messages
+    present_tools: set[str] = set()
+    for msg in new_messages:
+        if _has_tool_title(msg):
+            title: str = msg.metadata.get("title", "")
+            # smolagents title format: "🛠️ Used tool <name>"
+            if "Used tool" in title:
+                tool_name = title.split("Used tool", 1)[-1].strip()
+                present_tools.add(tool_name)
+
+    supplemented = list(new_messages)
+    for step in steps_slice:
+        for tc in getattr(step, "tool_calls", None) or []:
+            name = getattr(tc, "name", "") or ""
+            if name in ("final_answer", "") or name in present_tools:
+                continue
+            # Build a done-state panel for this missing tool call
+            args = getattr(tc, "arguments", {})
+            content = str(args) if not isinstance(args, dict) else str(args)
+            supplemented.append(
+                gr.ChatMessage(
+                    role="assistant",
+                    content=content,
+                    metadata={"title": f"🛠️ Used tool {name}", "status": "done"},
+                )
+            )
+            present_tools.add(name)
+            logger.debug("data_logger: supplemented UI panel for tool '%s'", name)
+
+    return supplemented
+
+
+def _stream_with_tool_capture(
+    task: str,
+    tool_responses: dict[str, str],
+):
+    """
+    Custom streaming generator that mirrors ``stream_to_gradio`` but also
+    intercepts ``ToolOutput`` events yielded by ``agent.run(stream=True)``.
+
+    ``stream_to_gradio`` silently drops ``ToolOutput`` events; this wrapper
+    captures them so each ``ToolInvocation`` can store its individual
+    response string rather than relying on the combined ``observations``.
+
+    Parameters
+    ----------
+    task:
+        The user message to run.
+    tool_responses:
+        Mutable dict populated in place: ``{tool_call_id: observation_str}``.
+        Callers read this after the generator is exhausted.
+
+    Yields
+    ------
+    ``gr.ChatMessage`` objects (tool-call panels and text chunks) — identical
+    to what ``stream_to_gradio`` would yield.
+    """
+    from smolagents.agents import ChatMessageStreamDelta, ToolOutput
+    from smolagents.gradio_ui import agglomerate_stream_deltas, pull_messages_from_step
+    from smolagents.memory import ActionStep, FinalAnswerStep, PlanningStep
+
+    accumulated_events: list = []
+    for event in agent.run(task, stream=True, reset=False):
+        if isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
+            for message in pull_messages_from_step(
+                event,
+                skip_model_outputs=getattr(agent, "stream_outputs", False),
+            ):
+                yield message
+            accumulated_events = []
+        elif isinstance(event, ChatMessageStreamDelta):
+            accumulated_events.append(event)
+            text = agglomerate_stream_deltas(accumulated_events).render_as_markdown()
+            yield text
+        elif isinstance(event, ToolOutput):
+            # Capture individual tool response — not forwarded to UI
+            tc_id = getattr(event, "id", "") or ""
+            observation = getattr(event, "observation", "") or ""
+            if tc_id:
+                tool_responses[tc_id] = observation
 
 
 def chat(
@@ -130,7 +326,13 @@ def chat(
 
     # --- Agent call with tool-call tracking ---
     try:
-        from smolagents import stream_to_gradio
+        # Snapshot the step count BEFORE this turn so we can extract only
+        # the new ActionSteps produced during this turn after streaming ends.
+        _steps_before = len(getattr(agent.memory, "steps", []) or [])
+
+        # Per-tool responses captured from ToolOutput events during streaming.
+        # Populated in place by _stream_with_tool_capture().
+        _tool_responses: dict[str, str] = {}
 
         # new_messages accumulates every chunk yielded for this turn:
         #   - gr.ChatMessage with metadata.title  → tool-call panels (expandable)
@@ -138,7 +340,7 @@ def chat(
         # Tool-call panels are updated in-place (pending → done) by matching title.
         new_messages: list = []
 
-        for chunk in stream_to_gradio(agent, task=message, reset_agent_memory=False):
+        for chunk in _stream_with_tool_capture(message, _tool_responses):
             if not hasattr(chunk, "content") or chunk.content is None:
                 continue
 
@@ -207,6 +409,33 @@ def chat(
                     session_id,
                     _make_langfuse_url(session_id),
                 )
+
+        # --- Post-streaming: extract structured data from agent memory ---
+        # Get only the steps produced during THIS turn (not accumulated history).
+        _all_steps = list(getattr(agent.memory, "steps", []) or [])
+        _new_steps = _all_steps[_steps_before:]
+
+        # Supplement the UI with any tool-call panels that smolagents dropped
+        # (it only shows tool_calls[0] per step; parallel calls are invisible).
+        new_messages = _supplement_tool_panels(new_messages, _new_steps)
+        # Emit the final supplemented state so the UI shows all tool calls.
+        yield (
+            history + [{"role": "user", "content": message}] + new_messages,
+            session_id,
+            _make_langfuse_url(session_id),
+        )
+
+        # --- Data logging: capture completed turn asynchronously ---
+        log_interaction(
+            conversation_id=session_id,
+            model_id=cfg.model_id,
+            app_version=cfg.app_version,
+            user_input=message,
+            final_answer=_extract_assistant_response(new_messages),
+            agent_steps=_parse_memory_steps(_new_steps, _tool_responses),
+            turn_number=len(history) // 2,  # each full turn = user + assistant
+            extra={"langfuse_url": _make_langfuse_url(session_id)},
+        )
 
     except MCPToolError:
         # MCPToolError is already converted to a safe "[Tool unavailable: ...]"

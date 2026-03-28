@@ -35,6 +35,18 @@ class Config:
     # Application metadata
     app_version: str = "dev"
 
+    # ---------------------------------------------------------------------------
+    # Data logging (all optional — logging degrades gracefully when unset)
+    # ---------------------------------------------------------------------------
+    # Directory for the local JSONL interaction log file.
+    data_log_dir: str = "logs"
+    # HuggingFace Hub dataset repo ID to sync logs to, e.g. "username/chat-logs".
+    hf_dataset_repo_id: str = ""
+    # HuggingFace write token.  Required when hf_dataset_repo_id is set.
+    hf_token: str = ""
+    # How often (seconds) to push the local log file to HF Hub.  Default: 300.
+    hf_sync_interval: int = 300
+
 
 def _require(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -65,4 +77,8 @@ def load_config() -> Config:
         ),
         langfuse_project_id=_optional("LANGFUSE_PROJECT_ID", ""),
         app_version=_optional("APP_VERSION", "dev"),
+        data_log_dir=_optional("DATA_LOG_DIR", "logs"),
+        hf_dataset_repo_id=_optional("HF_DATASET_REPO_ID", ""),
+        hf_token=_optional("HF_TOKEN", ""),
+        hf_sync_interval=int(_optional("HF_SYNC_INTERVAL", "300")),
     )
