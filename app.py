@@ -42,18 +42,23 @@ cfg = load_config()
 mcp_tools, _mcp_stack = build_mcp_tools(
     [cfg.mcp_server_url_1, cfg.mcp_server_url_2]
 )
+atexit.register(_mcp_stack.close)
 
 agent = build_agent(
     tools=mcp_tools,
     config=cfg,
 )
 
-# Telemetry — import deferred so startup works even if telemetry packages are
-# absent; bootstrap_telemetry() handles its own graceful degradation.
+# Telemetry — TelemetrySession lives in our own module (no optional deps at
+# module level) so it is always importable.  bootstrap_telemetry() is deferred
+# inside a try/except so startup works even when Langfuse isn't installed.
+from src.telemetry import TelemetrySession
+
 try:
-    from src.telemetry import bootstrap_telemetry
+    from src.telemetry import bootstrap_telemetry, shutdown_telemetry
 
     langfuse = bootstrap_telemetry(cfg)
+    atexit.register(shutdown_telemetry, langfuse)
 except ImportError:
     langfuse = None
     logger.warning("Telemetry module not available — continuing without tracing.")
@@ -129,23 +134,7 @@ def chat(
         logger.info("Session %s: history trimmed to %d turns.", session_id, MAX_HISTORY_TURNS)
 
     # --- Langfuse v4: propagate session metadata to all child observations ---
-    # We call __enter__() manually and intentionally skip __exit__() to avoid
-    # "Failed to detach context" errors from OpenTelemetry.  These errors occur
-    # because Gradio's streaming event loop resumes the generator in a different
-    # async task context than the one where __enter__ (and the ContextVar tokens)
-    # was called, making the reset() call in __exit__ raise ValueError.
-    # It is safe to skip __exit__() here because Gradio creates a fresh context
-    # copy (copy_context()) for every request, so the session attributes stay
-    # scoped to this one request's task and are cleaned up when the task ends.
-    if langfuse is not None:
-        try:
-            from langfuse import propagate_attributes
-            propagate_attributes(
-                session_id=session_id,
-                metadata={"app_version": cfg.app_version},
-            ).__enter__()
-        except Exception as exc:
-            logger.warning("Could not propagate session attributes: %s", exc)
+    TelemetrySession(langfuse, session_id, cfg.app_version).attach()
 
     # --- Agent call with tool-call tracking ---
     try:
@@ -215,11 +204,15 @@ def chat(
             extra={"langfuse_url": _make_langfuse_url(session_id)},
         )
 
-    except MCPToolError:
+    except MCPToolError as exc:
         # MCPToolError is already converted to a safe "[Tool unavailable: ...]"
         # string by the tool wrapper in mcp_client.py and fed into agent reasoning.
         # If it somehow escapes, surface a generic message and re-raise to the log.
-        logger.exception("MCPToolError escaped agent reasoning context.")
+        logger.exception(
+            "MCPToolError escaped agent reasoning context — tool='%s' category='%s'.",
+            exc.tool_name,
+            exc.category,
+        )
         yield (
             history + [
                 {"role": "user", "content": message},

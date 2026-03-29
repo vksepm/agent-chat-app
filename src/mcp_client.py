@@ -23,9 +23,35 @@ from smolagents import MCPClient
 
 logger = logging.getLogger(__name__)
 
+# Sentinel — the smolagents Tool callable attribute name.
+# If smolagents renames this method, update here only.
+# See: https://huggingface.co/docs/smolagents/reference/tools
+_TOOL_CALL_ATTR = "forward"
+
 
 class MCPToolError(Exception):
-    """Raised when an MCP tool call returns isError=true or the transport fails."""
+    """Raised when an MCP tool call fails at the transport or protocol layer.
+
+    Attributes
+    ----------
+    tool_name : str
+        Name of the tool that failed (for logging/metrics).
+    category : str
+        One of ``"network"``, ``"auth"``, ``"tool_error"``, ``"unknown"``.
+    safe_message : str
+        Sanitised message safe to expose to the LLM and UI.
+    """
+
+    def __init__(
+        self,
+        safe_message: str,
+        tool_name: str = "unknown",
+        category: str = "unknown",
+    ) -> None:
+        super().__init__(safe_message)
+        self.tool_name = tool_name
+        self.category = category
+        self.safe_message = safe_message
 
 
 def _validate_url(url: str) -> None:
@@ -36,26 +62,90 @@ def _validate_url(url: str) -> None:
         )
 
 
-def _wrap_tool(tool: Any) -> Any:
+def _sanitize_error(exc: Exception) -> tuple[str, str]:
+    """Return ``(safe_message, category)`` from a raw exception.
+
+    Strips sensitive content (URLs, tokens, full tracebacks) from the message.
+    Category is one of: ``"network"``, ``"auth"``, ``"tool_error"``,
+    ``"unknown"``.
+
+    Parameters
+    ----------
+    exc:
+        The original exception raised by the tool call.
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(safe_message, category)`` where ``safe_message`` is safe to expose
+        to the LLM / UI and ``category`` identifies the failure type.
     """
-    Patch tool.forward() to convert any MCP-layer exception into MCPToolError.
+    raw = str(exc)
+
+    if isinstance(exc, (ConnectionError, TimeoutError)) or "timeout" in raw.lower():
+        return "Tool is temporarily unreachable (network error).", "network"
+    if "401" in raw or "403" in raw or "auth" in raw.lower():
+        return "Tool authentication failed.", "auth"
+    if "tool_error" in raw.lower() or "isError" in raw:
+        # Limit exposed message length — remote error body may be large.
+        truncated = raw[:200] + ("..." if len(raw) > 200 else "")
+        return f"Tool returned an error: {truncated}", "tool_error"
+    return "Tool call failed (unknown error).", "unknown"
+
+
+def _wrap_tool(tool: Any) -> Any:
+    """Patch tool's callable attribute to convert exceptions into MCPToolError.
 
     The smolagents ToolCallingAgent catches exceptions raised by forward() and
     feeds the message back to the LLM as the tool's "observation" — so raising
     MCPToolError causes the agent to reason with "[Tool unavailable: ...]" as
     context rather than crashing.  All other (non-MCP) exceptions propagate
     upward from agent.run() to the T013 catch-all in app.py.
+
+    Parameters
+    ----------
+    tool:
+        A smolagents Tool object returned by MCPClient.
+
+    Returns
+    -------
+    The same tool object, with its ``forward`` method patched.
+
+    Raises
+    ------
+    ValueError
+        If the tool does not have the expected callable attribute
+        (guarded by ``_TOOL_CALL_ATTR``).
     """
-    original_forward = tool.forward
+    if not hasattr(tool, _TOOL_CALL_ATTR):
+        raise ValueError(
+            f"Cannot wrap tool {tool!r}: missing attribute '{_TOOL_CALL_ATTR}'. "
+            f"Expected a smolagents Tool with a '{_TOOL_CALL_ATTR}()' method. "
+            f"If smolagents renamed the callable, update _TOOL_CALL_ATTR in "
+            f"src/mcp_client.py."
+        )
+
+    tool_name = getattr(tool, "name", "unknown")
+    original = getattr(tool, _TOOL_CALL_ATTR)
 
     def _safe_forward(*args: Any, **kwargs: Any) -> Any:
         try:
-            return original_forward(*args, **kwargs)
+            return original(*args, **kwargs)
         except Exception as exc:
-            safe_msg = f"[Tool unavailable: {exc}]"
-            raise MCPToolError(safe_msg) from exc
+            safe_msg, category = _sanitize_error(exc)
+            logger.warning(
+                "MCP tool '%s' failed [%s]: %s",
+                tool_name,
+                category,
+                safe_msg,
+            )
+            raise MCPToolError(
+                f"[Tool unavailable: {safe_msg}]",
+                tool_name=tool_name,
+                category=category,
+            ) from exc
 
-    tool.forward = _safe_forward
+    setattr(tool, _TOOL_CALL_ATTR, _safe_forward)
     return tool
 
 
