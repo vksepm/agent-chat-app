@@ -9,6 +9,7 @@ Wires together:
   - Gradio chat UI with streaming, session isolation, and Langfuse metadata panel
 """
 
+import atexit
 import dataclasses
 import logging
 import os
@@ -20,7 +21,7 @@ import gradio as gr
 
 from src.agent import build_agent
 from src.config import load_config
-from src.data_logger import init_logger, log_interaction
+from src.data_logger import DataLogger
 from src.mcp_client import MCPToolError, build_mcp_tools
 from src.smolagents_adapter import parse_action_steps, stream_with_tool_capture
 from src.tool_panel_manager import ToolPanelManager
@@ -61,12 +62,16 @@ except ImportError:
 # Data logger — initialise background JSONL logger + HF Hub sync
 # ---------------------------------------------------------------------------
 
-init_logger(
+_data_logger = DataLogger(
     log_dir=cfg.data_log_dir,
     repo_id=cfg.hf_dataset_repo_id,
     hf_token=cfg.hf_token,
     sync_interval=cfg.hf_sync_interval,
-)
+).start()
+
+# Drain the queue and optionally push a final HF Hub upload on process exit
+# (Ctrl-C, demo.close(), or SIGTERM).
+atexit.register(_data_logger.shutdown, timeout=10, final_sync=True)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +204,7 @@ def chat(
         )
 
         # --- Data logging: capture completed turn asynchronously ---
-        log_interaction(
+        _data_logger.log(
             conversation_id=session_id,
             model_id=cfg.model_id,
             app_version=cfg.app_version,

@@ -10,10 +10,9 @@ conversation turn, and periodically synced to a HuggingFace Hub dataset.
 
 Architecture
 ------------
-* ``log_interaction()`` — public, non-blocking; enqueues a log entry.
-* ``_log_worker``        — background daemon thread that validates + writes.
-* ``_sync_worker``       — background daemon thread that pushes the JSONL file
-                           to HuggingFace Hub every ``sync_interval`` seconds.
+* ``DataLogger``  — owns its own queue, threads, and lock.  Instantiate once;
+                    call ``start()``, then ``log()``, then ``shutdown()``.
+                    Also usable as a context manager.
 
 JSONL structure: one line per turn, all turns sharing the same
 ``conversation_id`` form a complete conversation (group + order by
@@ -30,7 +29,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -168,12 +167,15 @@ class ConversationTurnLog(BaseModel):
 
 
 def _write_jsonl(path: Path, entry: ConversationTurnLog) -> None:
-    """Append a validated entry to the local JSONL file (lock-protected)."""
+    """Append a validated entry to the local JSONL file.
+
+    Callers are responsible for acquiring any necessary write lock before
+    calling this function.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     line = entry.model_dump_json() + "\n"
-    with _write_lock:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line)
 
 
 def _upload_to_hub(
@@ -222,62 +224,37 @@ def _upload_to_hub(
 
 
 # ---------------------------------------------------------------------------
-# Background worker threads
+# DataLogger
 # ---------------------------------------------------------------------------
 
-_log_queue: Queue = Queue()
-_jsonl_path: Path | None = None
-_repo_id: str | None = None
-_hf_token: str | None = None
-_sync_interval: int = 300  # seconds
-_sync_stop: threading.Event = threading.Event()
-_write_lock: threading.Lock = threading.Lock()  # guards concurrent JSONL appends
+#: Sentinel value placed in the log queue to signal the worker to exit.
+_STOP_SENTINEL = None
 
 
-def _log_worker() -> None:
-    """Drain the queue: validate each entry and write it to the local JSONL file."""
-    while True:
-        entry = _log_queue.get()
-        try:
-            if isinstance(entry, ConversationTurnLog) and _jsonl_path is not None:
-                _write_jsonl(_jsonl_path, entry)
-                logger.debug(
-                    "data_logger: wrote conversation_id=%s turn=%d log_id=%s",
-                    entry.conversation_id,
-                    entry.turn_number,
-                    entry.log_id,
-                )
-        except Exception as exc:
-            logger.error("data_logger: write failed — %s", exc)
-        finally:
-            _log_queue.task_done()
+class DataLogger:
+    """Non-blocking interaction logger with optional HuggingFace Hub sync.
 
+    Owns its own queue, write lock, and daemon threads so multiple independent
+    instances can coexist in the same process (e.g. one per integration test).
 
-def _sync_worker() -> None:
-    """Periodically push the local JSONL to HuggingFace Hub."""
-    while not _sync_stop.wait(timeout=_sync_interval):
-        if (
-            _jsonl_path is not None
-            and _jsonl_path.exists()
-            and _repo_id
-            and _hf_token
-        ):
-            _upload_to_hub(_jsonl_path, _repo_id, _hf_token)
+    Usage
+    -----
+    .. code-block:: python
 
+        dl = DataLogger(log_dir="logs", repo_id="user/ds", hf_token="hf_...")
+        dl.start()           # spawn worker threads; returns self for chaining
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+        dl.log(...)          # non-blocking enqueue
 
+        dl.shutdown(         # drain queue, stop sync, optional final upload
+            timeout=10,
+            final_sync=True,
+        )
 
-def init_logger(
-    log_dir: str = "logs",
-    repo_id: str | None = None,
-    hf_token: str | None = None,
-    sync_interval: int = 300,
-) -> None:
-    """
-    Initialise the data logger.  Call once at application startup.
+    Or as a context manager::
+
+        with DataLogger(...) as dl:
+            dl.log(...)
 
     Parameters
     ----------
@@ -290,93 +267,216 @@ def init_logger(
         HuggingFace write token.  Required when *repo_id* is set.
     sync_interval:
         How often (seconds) to push updates to HF Hub.  Default 300 (5 min).
+        Floored at 30 seconds.
+    _upload_fn:
+        Injectable upload callable used in tests.  Defaults to the real
+        ``_upload_to_hub`` function.
     """
-    global _jsonl_path, _repo_id, _hf_token, _sync_interval
 
-    _jsonl_path = Path(log_dir) / "interactions.jsonl"
-    _repo_id = repo_id or None
-    _hf_token = hf_token or None
-    _sync_interval = max(30, sync_interval)  # floor at 30s
+    def __init__(
+        self,
+        log_dir: str = "logs",
+        repo_id: str | None = None,
+        hf_token: str | None = None,
+        sync_interval: int = 300,
+        _upload_fn: Callable | None = None,
+    ) -> None:
+        self._jsonl_path = Path(log_dir) / "interactions.jsonl"
+        self._repo_id = repo_id or None
+        self._hf_token = hf_token or None
+        self._sync_interval = max(30, sync_interval)
+        self._upload_fn: Callable = _upload_fn or _upload_to_hub
 
-    # Start log-write worker
-    threading.Thread(target=_log_worker, name="data-log-worker", daemon=True).start()
+        self._queue: Queue = Queue()
+        self._write_lock = threading.Lock()
+        self._sync_stop = threading.Event()
+        self._started = False
+        self._log_thread: threading.Thread | None = None
+        self._sync_thread: threading.Thread | None = None
 
-    # Start HF sync worker only if credentials are provided
-    if _repo_id and _hf_token:
-        threading.Thread(
-            target=_sync_worker, name="data-sync-worker", daemon=True
-        ).start()
-        logger.info(
-            "data_logger: HF Hub sync enabled — repo=%s interval=%ds",
-            _repo_id,
-            _sync_interval,
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> "DataLogger":
+        """Spawn worker threads and begin accepting log entries.
+
+        Returns *self* so calls can be chained: ``DataLogger(...).start()``.
+
+        Raises
+        ------
+        RuntimeError
+            If ``start()`` is called a second time on the same instance.
+        """
+        if self._started:
+            raise RuntimeError(
+                "DataLogger.start() called twice on the same instance. "
+                "Create a new DataLogger instance instead."
+            )
+        self._started = True
+
+        self._log_thread = threading.Thread(
+            target=self._log_worker, name="data-log-worker", daemon=True
         )
-    else:
-        logger.info(
-            "data_logger: HF Hub sync disabled (HF_TOKEN / HF_DATASET_REPO_ID not set)"
-        )
+        self._log_thread.start()
 
-    logger.info("data_logger: logging to %s", _jsonl_path)
+        if self._repo_id and self._hf_token:
+            self._sync_thread = threading.Thread(
+                target=self._sync_worker, name="data-sync-worker", daemon=True
+            )
+            self._sync_thread.start()
+            logger.info(
+                "data_logger: HF Hub sync enabled — repo=%s interval=%ds",
+                self._repo_id,
+                self._sync_interval,
+            )
+        else:
+            logger.info(
+                "data_logger: HF Hub sync disabled "
+                "(HF_TOKEN / HF_DATASET_REPO_ID not set)"
+            )
 
+        logger.info("data_logger: logging to %s", self._jsonl_path)
+        return self
 
-def log_interaction(
-    conversation_id: str,
-    model_id: str,
-    app_version: str,
-    user_input: str,
-    final_answer: str,
-    agent_steps: list[dict],
-    turn_number: int = 0,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    """
-    Enqueue a conversation turn for async logging.  Non-blocking.
+    def shutdown(self, timeout: float = 10.0, final_sync: bool = False) -> None:
+        """Drain the log queue, stop worker threads, and optionally upload.
 
-    Parameters
-    ----------
-    conversation_id:
-        Gradio per-tab session UUID (constant for the whole conversation).
-    model_id:
-        LiteLLM model identifier used for this turn.
-    app_version:
-        Application version string from config.
-    user_input:
-        The raw user message for this turn.
-    final_answer:
-        The agent's final plain-text answer.
-    agent_steps:
-        List of dicts matching ``ActionStepLog`` schema, produced by
-        ``_parse_memory_steps()`` in ``app.py``.
-    turn_number:
-        0-based position of this turn in the conversation.
-    extra:
-        Arbitrary extra key/value metadata to attach to the log entry.
-    """
-    try:
-        parsed_steps = [ActionStepLog(**s) for s in agent_steps]
-        entry = ConversationTurnLog(
-            conversation_id=conversation_id,
-            model=ModelInfo(model_id=model_id, app_version=app_version),
-            user_input=user_input,
-            final_answer=final_answer,
-            agent_steps=parsed_steps,
-            turn_number=turn_number,
-            extra=extra or {},
-        )
-        _log_queue.put(entry)
-    except Exception as exc:
-        # Validation failure or other error — log but never crash the app
-        logger.warning("data_logger: failed to enqueue entry — %s", exc)
+        Blocks until the log worker exits (up to *timeout* seconds) and the
+        sync worker is signalled to stop.  Safe to call multiple times; second
+        and subsequent calls are no-ops.
 
+        Parameters
+        ----------
+        timeout:
+            Maximum seconds to wait for the log worker to drain and exit.
+        final_sync:
+            When ``True`` and HF Hub credentials are configured, perform one
+            final upload after the queue drains.
+        """
+        if not self._started:
+            return
 
-def force_sync() -> bool:
-    """
-    Immediately push the local JSONL to HF Hub (blocking).
+        # Signal log worker to exit after draining all pending entries.
+        self._queue.put(_STOP_SENTINEL)
+        if self._log_thread is not None:
+            self._log_thread.join(timeout=timeout)
 
-    Returns True on success, False if sync is not configured or upload fails.
-    Useful for testing or graceful shutdown hooks.
-    """
-    if _jsonl_path and _jsonl_path.exists() and _repo_id and _hf_token:
-        return _upload_to_hub(_jsonl_path, _repo_id, _hf_token)
-    return False
+        # Signal sync worker to stop its timer loop.
+        self._sync_stop.set()
+        if self._sync_thread is not None:
+            self._sync_thread.join(timeout=2.0)
+
+        if (
+            final_sync
+            and self._jsonl_path.exists()
+            and self._repo_id
+            and self._hf_token
+        ):
+            self._upload_fn(self._jsonl_path, self._repo_id, self._hf_token)
+
+        # Mark as stopped so log() calls after shutdown are silently dropped.
+        self._started = False
+
+    def __enter__(self) -> "DataLogger":
+        return self.start()
+
+    def __exit__(self, *_: Any) -> None:
+        self.shutdown()
+
+    # ------------------------------------------------------------------
+    # Public logging API
+    # ------------------------------------------------------------------
+
+    def log(
+        self,
+        conversation_id: str,
+        model_id: str,
+        app_version: str,
+        user_input: str,
+        final_answer: str,
+        agent_steps: list[dict],
+        turn_number: int = 0,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Enqueue a conversation turn for async logging.  Non-blocking.
+
+        Silently drops the entry (with a WARNING) if called before ``start()``
+        or after ``shutdown()``, or if Pydantic validation fails.
+
+        Parameters
+        ----------
+        conversation_id:
+            Gradio per-tab session UUID (constant for the whole conversation).
+        model_id:
+            LiteLLM model identifier used for this turn.
+        app_version:
+            Application version string from config.
+        user_input:
+            The raw user message for this turn.
+        final_answer:
+            The agent's final plain-text answer.
+        agent_steps:
+            List of dicts matching ``ActionStepLog`` schema.
+        turn_number:
+            0-based position of this turn in the conversation.
+        extra:
+            Arbitrary extra key/value metadata to attach to the log entry.
+        """
+        if not self._started:
+            logger.warning(
+                "data_logger: log() called before start() or after shutdown() "
+                "— entry discarded"
+            )
+            return
+        try:
+            parsed_steps = [ActionStepLog(**s) for s in agent_steps]
+            entry = ConversationTurnLog(
+                conversation_id=conversation_id,
+                model=ModelInfo(model_id=model_id, app_version=app_version),
+                user_input=user_input,
+                final_answer=final_answer,
+                agent_steps=parsed_steps,
+                turn_number=turn_number,
+                extra=extra or {},
+            )
+            self._queue.put(entry)
+        except Exception as exc:
+            logger.warning("data_logger: failed to enqueue entry — %s", exc)
+
+    # ------------------------------------------------------------------
+    # Internal worker methods
+    # ------------------------------------------------------------------
+
+    def _log_worker(self) -> None:
+        """Drain the queue: validate each entry and write it to the JSONL file."""
+        while True:
+            entry = self._queue.get()
+            if entry is _STOP_SENTINEL:
+                self._queue.task_done()
+                break
+            try:
+                if isinstance(entry, ConversationTurnLog):
+                    with self._write_lock:
+                        _write_jsonl(self._jsonl_path, entry)
+                    logger.debug(
+                        "data_logger: wrote conversation_id=%s turn=%d log_id=%s",
+                        entry.conversation_id,
+                        entry.turn_number,
+                        entry.log_id,
+                    )
+            except Exception as exc:
+                logger.error("data_logger: write failed — %s", exc)
+            finally:
+                self._queue.task_done()
+
+    def _sync_worker(self) -> None:
+        """Periodically push the local JSONL to HuggingFace Hub."""
+        while not self._sync_stop.wait(timeout=self._sync_interval):
+            if (
+                self._jsonl_path.exists()
+                and self._repo_id
+                and self._hf_token
+            ):
+                self._upload_fn(self._jsonl_path, self._repo_id, self._hf_token)
 

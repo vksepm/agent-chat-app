@@ -4,13 +4,15 @@ tests/unit/test_data_logger.py — Unit tests for src/data_logger.
 Tests cover:
 - Pydantic schema validation (valid and invalid inputs)
 - JSONL file write round-trip
-- log_interaction() enqueueing and worker flush
+- DataLogger lifecycle (start, log, shutdown, context manager)
 - Timer utility
 """
 
 import json
+import threading
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -18,12 +20,10 @@ from pydantic import ValidationError
 from src.data_logger import (
     ActionStepLog,
     ConversationTurnLog,
+    DataLogger,
     ModelInfo,
     ToolInvocation,
     _write_jsonl,
-    init_logger,
-    log_interaction,
-    _log_queue,
 )
 from src.timer import Timer
 
@@ -259,14 +259,135 @@ class TestWriteJsonl:
 
 
 # ---------------------------------------------------------------------------
-# log_interaction integration (queue + worker)
+# DataLogger lifecycle tests
 # ---------------------------------------------------------------------------
 
 
-class TestLogInteraction:
+class TestDataLoggerLifecycle:
+    def test_start_spawns_log_worker_thread(self, tmp_path: Path):
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        names = {t.name for t in threading.enumerate()}
+        assert "data-log-worker" in names
+        dl.shutdown(timeout=5)
+
+    def test_start_spawns_sync_worker_when_credentials_provided(self, tmp_path: Path):
+        dl = DataLogger(
+            log_dir=str(tmp_path),
+            repo_id="user/ds",
+            hf_token="hf_test",
+            sync_interval=300,
+            _upload_fn=MagicMock(return_value=True),
+        ).start()
+        names = {t.name for t in threading.enumerate()}
+        assert "data-log-worker" in names
+        assert "data-sync-worker" in names
+        dl.shutdown(timeout=5)
+
+    def test_hf_sync_disabled_when_no_credentials(self, tmp_path: Path):
+        dl = DataLogger(log_dir=str(tmp_path), repo_id=None, hf_token=None).start()
+        names = {t.name for t in threading.enumerate()}
+        assert "data-log-worker" in names
+        assert "data-sync-worker" not in names
+        dl.shutdown(timeout=5)
+
+    def test_double_start_raises(self, tmp_path: Path):
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        with pytest.raises(RuntimeError, match="start\\(\\) called twice"):
+            dl.start()
+        dl.shutdown(timeout=5)
+
+    def test_shutdown_drains_queue(self, tmp_path: Path):
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        for i in range(5):
+            dl.log(
+                conversation_id=f"conv-{i}",
+                model_id="openai/gpt-4o",
+                app_version="test",
+                user_input=f"question {i}",
+                final_answer=f"answer {i}",
+                agent_steps=[],
+                turn_number=i,
+            )
+        dl.shutdown(timeout=5)
+        log_path = tmp_path / "interactions.jsonl"
+        assert log_path.exists()
+        lines = log_path.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 5
+
+    def test_log_after_shutdown_is_silently_dropped(self, tmp_path: Path):
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        dl.shutdown(timeout=5)
+        # Must not raise and must not block
+        dl.log(
+            conversation_id="conv-1",
+            model_id="openai/gpt-4o",
+            app_version="dev",
+            user_input="hello",
+            final_answer="world",
+            agent_steps=[],
+        )
+        log_path = tmp_path / "interactions.jsonl"
+        assert not log_path.exists()
+
+    def test_context_manager_calls_shutdown(self, tmp_path: Path):
+        with DataLogger(log_dir=str(tmp_path)) as dl:
+            dl.log(
+                conversation_id="conv-ctx",
+                model_id="openai/gpt-4o",
+                app_version="test",
+                user_input="ctx question",
+                final_answer="ctx answer",
+                agent_steps=[],
+            )
+        log_path = tmp_path / "interactions.jsonl"
+        assert log_path.exists()
+        data = json.loads(log_path.read_text(encoding="utf-8").strip())
+        assert data["user_input"] == "ctx question"
+
+    def test_shutdown_calls_final_sync_when_requested(self, tmp_path: Path):
+        mock_upload = MagicMock(return_value=True)
+        dl = DataLogger(
+            log_dir=str(tmp_path),
+            repo_id="user/ds",
+            hf_token="hf_test",
+            _upload_fn=mock_upload,
+        ).start()
+        dl.log(
+            conversation_id="conv-sync",
+            model_id="openai/gpt-4o",
+            app_version="test",
+            user_input="sync test",
+            final_answer="ok",
+            agent_steps=[],
+        )
+        dl.shutdown(timeout=5, final_sync=True)
+        mock_upload.assert_called_once()
+
+    def test_invalid_log_entry_does_not_crash(self, tmp_path: Path):
+        """Pydantic validation failure must not raise and must not write garbage."""
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        dl.log(
+            conversation_id="conv-bad",
+            model_id="openai/gpt-4o",
+            app_version="dev",
+            user_input="",  # invalid — empty
+            final_answer="",
+            agent_steps=[],
+        )
+        dl.shutdown(timeout=5)
+        log_path = tmp_path / "interactions.jsonl"
+        assert not log_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# DataLogger — queue + write round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestDataLoggerWrite:
     def test_enqueues_and_flushes_simple(self, tmp_path: Path):
-        init_logger(log_dir=str(tmp_path), repo_id=None, hf_token=None)
-        log_interaction(
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        dl.log(
             conversation_id="conv-abc",
             model_id="openai/gpt-4o",
             app_version="test",
@@ -274,7 +395,7 @@ class TestLogInteraction:
             final_answer="4",
             agent_steps=[],
         )
-        _log_queue.join()
+        dl.shutdown(timeout=5)
         log_path = tmp_path / "interactions.jsonl"
         assert log_path.exists()
         data = json.loads(log_path.read_text(encoding="utf-8").strip())
@@ -284,8 +405,8 @@ class TestLogInteraction:
         assert data["conversation_id"] == "conv-abc"
 
     def test_with_full_agent_steps(self, tmp_path: Path):
-        init_logger(log_dir=str(tmp_path), repo_id=None, hf_token=None)
-        log_interaction(
+        dl = DataLogger(log_dir=str(tmp_path)).start()
+        dl.log(
             conversation_id="conv-xyz",
             model_id="openai/gpt-4o",
             app_version="1.0",
@@ -296,12 +417,18 @@ class TestLogInteraction:
                     "step_number": 1,
                     "model_output": "I'll fetch weather and news.",
                     "tool_invocations": [
-                        {"id": "tc-1", "tool_name": "get_current_weather",
-                         "arguments": {"location_name": "Paris", "temperature_unit": "celsius"},
-                         "response": '{"temperature": 9.6, "weather_description": "Mainly clear"}'},
-                        {"id": "tc-2", "tool_name": "news_search",
-                         "arguments": {"query": "France", "max_results": 5},
-                         "response": "1. Mbappé scores..."},
+                        {
+                            "id": "tc-1",
+                            "tool_name": "get_current_weather",
+                            "arguments": {"location_name": "Paris", "temperature_unit": "celsius"},
+                            "response": '{"temperature": 9.6, "weather_description": "Mainly clear"}',
+                        },
+                        {
+                            "id": "tc-2",
+                            "tool_name": "news_search",
+                            "arguments": {"query": "France", "max_results": 5},
+                            "response": "1. Mbappé scores...",
+                        },
                     ],
                     "observations": '{"temperature": 9.6}\n1. Mbappé scores...',
                     "duration_seconds": 3.09,
@@ -312,7 +439,7 @@ class TestLogInteraction:
                 }
             ],
         )
-        _log_queue.join()
+        dl.shutdown(timeout=5)
         log_path = tmp_path / "interactions.jsonl"
         data = json.loads(log_path.read_text(encoding="utf-8").strip())
         assert len(data["agent_steps"]) == 1
@@ -322,7 +449,6 @@ class TestLogInteraction:
         assert step["input_tokens"] == 3041
         assert step["total_tokens"] == 3116
         assert len(step["tool_invocations"]) == 2
-        # Verify per-tool responses are stored
         weather_inv = step["tool_invocations"][0]
         assert weather_inv["tool_name"] == "get_current_weather"
         assert weather_inv["arguments"]["location_name"] == "Paris"
@@ -331,26 +457,11 @@ class TestLogInteraction:
         assert news_inv["tool_name"] == "news_search"
         assert "Mbappé" in news_inv["response"]
 
-    def test_invalid_input_is_swallowed(self, tmp_path: Path):
-        """Validation failure must not raise — entry is discarded silently."""
-        init_logger(log_dir=str(tmp_path), repo_id=None, hf_token=None)
-        log_interaction(
-            conversation_id="conv-1",
-            model_id="openai/gpt-4o",
-            app_version="dev",
-            user_input="",  # invalid — empty
-            final_answer="",
-            agent_steps=[],
-        )
-        time.sleep(0.1)
-        log_path = tmp_path / "interactions.jsonl"
-        assert not log_path.exists()
-
     def test_multi_turn_same_conversation(self, tmp_path: Path):
         """Two turns with the same conversation_id should produce 2 JSONL lines."""
-        init_logger(log_dir=str(tmp_path), repo_id=None, hf_token=None)
+        dl = DataLogger(log_dir=str(tmp_path)).start()
         for i in range(2):
-            log_interaction(
+            dl.log(
                 conversation_id="conv-multi",
                 model_id="openai/gpt-4o",
                 app_version="dev",
@@ -359,7 +470,7 @@ class TestLogInteraction:
                 agent_steps=[],
                 turn_number=i,
             )
-        _log_queue.join()
+        dl.shutdown(timeout=5)
         log_path = tmp_path / "interactions.jsonl"
         lines = log_path.read_text(encoding="utf-8").strip().split("\n")
         assert len(lines) == 2
