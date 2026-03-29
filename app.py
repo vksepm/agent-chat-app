@@ -23,6 +23,7 @@ from src.config import load_config
 from src.data_logger import init_logger, log_interaction
 from src.mcp_client import MCPToolError, build_mcp_tools
 from src.smolagents_adapter import parse_action_steps, stream_with_tool_capture
+from src.tool_panel_manager import ToolPanelManager
 from theme import theme
 
 logging.basicConfig(
@@ -87,71 +88,7 @@ def _make_langfuse_url(session_id: str) -> str:
     return f"{base}/project/{cfg.langfuse_project_id}/traces?sessionId={session_id}"
 
 
-def _has_tool_title(msg) -> bool:
-    """Return True if *msg* is a tool-call ChatMessage (has a metadata title)."""
-    meta = getattr(msg, "metadata", None)
-    return isinstance(meta, dict) and bool(meta.get("title"))
 
-
-def _extract_assistant_response(messages: list) -> str:
-    """Return the final plain-text assistant response from new_messages."""
-    for msg in reversed(messages):
-        if not _has_tool_title(msg):
-            content = getattr(msg, "content", "") or ""
-            if isinstance(content, str):
-                return content
-    return ""
-
-
-
-
-
-def _supplement_tool_panels(new_messages: list, steps_slice: list) -> list:
-    """
-    Inject missing tool-call panels into *new_messages* for any tool call
-    in *steps_slice* whose name is not already represented.
-
-    smolagents' ``_process_action_step`` only creates a panel for
-    ``tool_calls[0]``; this function adds panels for ``tool_calls[1:]``
-    so every parallel tool call is visible in the Gradio chatbot.
-
-    Parameters
-    ----------
-    new_messages:
-        The accumulated list of ``gr.ChatMessage`` objects from streaming.
-    steps_slice:
-        A list of memory step objects from ``agent.memory.steps``.
-    """
-    # Collect tool names already present in new_messages
-    present_tools: set[str] = set()
-    for msg in new_messages:
-        if _has_tool_title(msg):
-            title: str = msg.metadata.get("title", "")
-            # smolagents title format: "🛠️ Used tool <name>"
-            if "Used tool" in title:
-                tool_name = title.split("Used tool", 1)[-1].strip()
-                present_tools.add(tool_name)
-
-    supplemented = list(new_messages)
-    for step in steps_slice:
-        for tc in getattr(step, "tool_calls", None) or []:
-            name = getattr(tc, "name", "") or ""
-            if name in ("final_answer", "") or name in present_tools:
-                continue
-            # Build a done-state panel for this missing tool call
-            args = getattr(tc, "arguments", {})
-            content = str(args) if not isinstance(args, dict) else str(args)
-            supplemented.append(
-                gr.ChatMessage(
-                    role="assistant",
-                    content=content,
-                    metadata={"title": f"🛠️ Used tool {name}", "status": "done"},
-                )
-            )
-            present_tools.add(name)
-            logger.debug("data_logger: supplemented UI panel for tool '%s'", name)
-
-    return supplemented
 
 
 
@@ -212,84 +149,39 @@ def chat(
         _steps_before = len(getattr(agent.memory, "steps", []) or [])
 
         # Per-tool responses captured from ToolOutput events during streaming.
-        # Populated in place by _stream_with_tool_capture().
+        # Populated in place by stream_with_tool_capture().
         _tool_responses: dict[str, str] = {}
 
-        # new_messages accumulates every chunk yielded for this turn:
-        #   - gr.ChatMessage with metadata.title  → tool-call panels (expandable)
-        #   - gr.ChatMessage without metadata      → streaming final-answer text
-        # Tool-call panels are updated in-place (pending → done) by matching title.
-        new_messages: list = []
+        # ToolPanelManager accumulates, deduplicates, and supplements
+        # gr.ChatMessage objects for this turn.
+        panel_mgr = ToolPanelManager()
 
         for chunk in stream_with_tool_capture(agent, message, _tool_responses):
-            if not hasattr(chunk, "content") or chunk.content is None:
-                continue
-
-            if _has_tool_title(chunk):
-                # Tool-call chunk: update the matching existing panel or append.
-                title = chunk.metadata["title"]
-                idx = next(
-                    (
-                        i for i, m in enumerate(new_messages)
-                        if _has_tool_title(m) and m.metadata["title"] == title
-                    ),
-                    None,
-                )
-                if idx is not None:
-                    new_messages[idx] = chunk
-                else:
-                    new_messages.append(chunk)
-            else:
-                # Final-answer text chunk: replace the last non-tool message
-                # (streaming update) or append a new one.
-                last_text_idx = next(
-                    (
-                        i for i in range(len(new_messages) - 1, -1, -1)
-                        if not _has_tool_title(new_messages[i])
-                    ),
-                    None,
-                )
-                if last_text_idx is not None:
-                    new_messages[last_text_idx] = chunk
-                else:
-                    new_messages.append(chunk)
-
+            panel_mgr.ingest(chunk)
             yield (
-                history + [{"role": "user", "content": message}] + new_messages,
+                history + [{"role": "user", "content": message}] + panel_mgr.messages,
                 session_id,
                 _make_langfuse_url(session_id),
             )
 
-        if not new_messages:
+        if not panel_mgr.messages:
             # Non-streaming fallback
             result = agent.run(message, reset=False)
-            new_messages = [
-                gr.ChatMessage(role="assistant", content=str(result) + truncation_notice)
-            ]
+            panel_mgr.ingest(gr.ChatMessage(role="assistant", content=str(result)))
+            if truncation_notice:
+                panel_mgr.append_to_last_text(truncation_notice)
             yield (
-                history + [{"role": "user", "content": message}] + new_messages,
+                history + [{"role": "user", "content": message}] + panel_mgr.messages,
                 session_id,
                 _make_langfuse_url(session_id),
             )
         elif truncation_notice:
-            # Append truncation notice to the last plain-text message.
-            last_text_idx = next(
-                (
-                    i for i in range(len(new_messages) - 1, -1, -1)
-                    if not _has_tool_title(new_messages[i])
-                ),
-                None,
+            panel_mgr.append_to_last_text(truncation_notice)
+            yield (
+                history + [{"role": "user", "content": message}] + panel_mgr.messages,
+                session_id,
+                _make_langfuse_url(session_id),
             )
-            if last_text_idx is not None:
-                last_content = getattr(new_messages[last_text_idx], "content", "") or ""
-                new_messages[last_text_idx] = gr.ChatMessage(
-                    role="assistant", content=last_content + truncation_notice
-                )
-                yield (
-                    history + [{"role": "user", "content": message}] + new_messages,
-                    session_id,
-                    _make_langfuse_url(session_id),
-                )
 
         # --- Post-streaming: extract structured data from agent memory ---
         # Get only the steps produced during THIS turn (not accumulated history).
@@ -298,10 +190,10 @@ def chat(
 
         # Supplement the UI with any tool-call panels that smolagents dropped
         # (it only shows tool_calls[0] per step; parallel calls are invisible).
-        new_messages = _supplement_tool_panels(new_messages, _new_steps)
+        panel_mgr.supplement(_new_steps)
         # Emit the final supplemented state so the UI shows all tool calls.
         yield (
-            history + [{"role": "user", "content": message}] + new_messages,
+            history + [{"role": "user", "content": message}] + panel_mgr.messages,
             session_id,
             _make_langfuse_url(session_id),
         )
@@ -312,7 +204,7 @@ def chat(
             model_id=cfg.model_id,
             app_version=cfg.app_version,
             user_input=message,
-            final_answer=_extract_assistant_response(new_messages),
+            final_answer=panel_mgr.final_answer(),
             agent_steps=[dataclasses.asdict(s) for s in parse_action_steps(_new_steps, _tool_responses)],
             turn_number=len(history) // 2,  # each full turn = user + assistant
             extra={"langfuse_url": _make_langfuse_url(session_id)},
