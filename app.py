@@ -261,7 +261,7 @@ _HEADER_HTML = """
 </div>
 """
 
-with gr.Blocks(title="AI Assistant", theme=theme, css=_css) as demo:
+with gr.Blocks(title="AI Assistant", theme=theme, css=_css, fill_height=True) as demo:
     # Per-session state — each browser tab gets an independent session_id (T018)
     session_state = gr.State(value=_new_session_id())
 
@@ -269,7 +269,6 @@ with gr.Blocks(title="AI Assistant", theme=theme, css=_css) as demo:
 
     chatbot = gr.Chatbot(
         label="Conversation",
-        height=520,
         show_label=False,
         render_markdown=True,
         elem_classes=["chatbot"],

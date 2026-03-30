@@ -20,9 +20,6 @@
 
     --input-border:       var(--secondary-300, #80b1ce);
     --input-focus-ring:   var(--secondary-400, #5595bc);
-
-    --chat-chrome-height-wide:   310px;
-    --chat-chrome-height-narrow: 440px;
 }
 
 /* ----------------------------------------------------------
@@ -61,11 +58,13 @@
 }
 
 /* ----------------------------------------------------------
-   Main chatbot area
+   Main chatbot area — flex-grows to fill remaining viewport
+   height when gr.Blocks(fill_height=True) is active.
    ---------------------------------------------------------- */
 div.block.chatbot {
-    height: calc(100svh - var(--chat-chrome-height-wide)) !important;
-    max-height: 820px !important;
+    flex: 1 1 0% !important;
+    min-height: 200px !important;
+    max-height: none !important;
     border-radius: 12px !important;
     overflow: hidden;
 }
@@ -220,12 +219,6 @@ div.block.chatbot {
 /* ----------------------------------------------------------
    Responsive
    ---------------------------------------------------------- */
-@media (max-width: 1024px) {
-    div.block.chatbot {
-        height: calc(100svh - var(--chat-chrome-height-narrow)) !important;
-    }
-}
-
 @media (max-width: 768px) {
     .app-header {
         padding: 10px 14px;
@@ -240,19 +233,10 @@ div.block.chatbot {
     .app-header-subtitle {
         font-size: 0.72rem;
     }
-    div.block.chatbot {
-        max-height: 480px !important;
-    }
 }
 
 @media (max-width: 480px) {
-    div.block.chatbot {
-        max-height: 360px !important;
-    }
-}
-
-@media (max-height: 900px) {
-    .chatbot {
-        max-height: 440px !important;
+    .app-header-subtitle {
+        display: none;
     }
 }
