@@ -36,3 +36,6 @@ Thumbs.db
 # HuggingFace Spaces
 *.log
 logs/
+
+# Draw.io
+*.drawio.bkp

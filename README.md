@@ -15,6 +15,9 @@ pinned: false
 An interactive AI assistant built with [smolagents](https://github.com/huggingface/smolagents),
 [Gradio](https://gradio.app), and [MCP](https://modelcontextprotocol.io) (Model Context Protocol).
 
+
+![architecture](./application%20architecture.drawio.svg)
+
 ## Features
 
 - **Tool-enabled chat**: the agent autonomously calls external tools exposed via MCP servers
